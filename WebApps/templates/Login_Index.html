@@ -1,10 +1,12 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Login Index</title>
-</head>
-<body>
+{% extends "layout.html" %}
+{% block title %}Login Index{% endblock %}
+{% block head %}
+    {{ super() }}
+    <style type="text/css">
+    .important { color: #336699; }
+    </style>
+{% endblock %}
+{% block content %}
     {% if message %}
     <p style="color:red">{{ message }}</p>
     {% endif %}
@@ -14,5 +16,4 @@
         <p><input name="password" placeholder="Password" type="password"></p>
         <p><button type="submit">Sign In</button></p>
     </form>
-</body>
-</html>
+{% endblock %}
