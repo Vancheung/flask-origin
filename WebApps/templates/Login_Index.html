@@ -1,5 +1,5 @@
 {% extends "layout.html" %}
-{% block title %}Login Index{% endblock %}
+{% block title %}Login Success{% endblock %}
 {% block head %}
     {{ super() }}
     <style type="text/css">
@@ -7,13 +7,5 @@
     </style>
 {% endblock %}
 {% block content %}
-    {% if message %}
-    <p style="color:red">{{ message }}</p>
-    {% endif %}
-    <form action="/login" method="post">
-        <legend>Please sign in:</legend>
-        <p><input name="username" placeholder="Username" value="{{ username }}"></p>
-        <p><input name="password" placeholder="Password" type="password"></p>
-        <p><button type="submit">Sign In</button></p>
-    </form>
+    <h1>Welcome,  {{ username }} </h1>
 {% endblock %}
