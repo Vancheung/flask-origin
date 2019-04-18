@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    {% block head %}
+    <link rel="stylesheet" href="{{ url_for('static',filename='style.css') }}">
+    <title>{% block title %}{% endblock %} - VAN CHEUNG</title>
+    {% endblock %}
+</head>
+<body>
+    <div id="content">{% block content %}{% endblock %}</div>
+    <div id="footer">
+        {% block footer %}
+        &copy; CopyRight 2019 by <a href="https://github.com/Vancheung">Vancheung</a>.
+        {% endblock %}
+    </div>
+</body>
+</html>
