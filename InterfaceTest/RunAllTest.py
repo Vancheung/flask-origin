@@ -15,6 +15,17 @@ class TestWebapps(unittest.TestCase):
     def test_index_username(self):
         rv = self.app.get('/user/testuser1/')
         assert rv._status_code == 200
+        assert b'Hello,testuser1' in rv.data
+
+    def test_index_id(self):
+        rv = self.app.get('/user/123/')
+        assert rv._status_code == 200
+        assert b'NO.123' in rv.data
+
+    def test_index_path(self):
+        rv = self.app.get('/user/123/aaa')
+        assert rv._status_code == 200
+        assert b'your path:123/aaa' in rv.data
 
     def login(self,username,password):
         return self.app.post('/login',data=dict(
