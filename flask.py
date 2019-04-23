@@ -13,15 +13,17 @@ import os
 import sys
 
 from jinja2 import Environment, PackageLoader, FileSystemLoader
-from werkzeug import Request as RequestBase, Response as ResponseBase, \
-     LocalStack, LocalProxy, create_environ, SharedDataMiddleware
+from werkzeug.wrappers import Request as RequestBase, Response as ResponseBase
+from werkzeug.local import LocalStack, LocalProxy
+from werkzeug.test import create_environ
+from werkzeug.middleware.shared_data import SharedDataMiddleware
 from werkzeug.routing import Map, Rule
 from werkzeug.exceptions import HTTPException
 from werkzeug.contrib.securecookie import SecureCookie
 
 # 这些从Werkzeug和Jinja2导入的辅助函数（utilities）没有在
 # 模块内使用，而是直接作为外部接口开放
-from werkzeug import abort, redirect
+#from werkzeug import abort, redirect
 from jinja2 import Markup, escape
 
 # 优先使用pkg_resource，如果无法工作则使用cwd。
@@ -284,7 +286,7 @@ class Flask(object):
         :param options: 这些选项将被转发给底层的Werkzeug服务器。更多信息
                         参见werkzeug.run_simple。
         """
-        from werkzeug import run_simple
+        from werkzeug.serving import run_simple
         if 'debug' in options:
             self.debug = options.pop('debug')
         options.setdefault('use_reloader', self.debug)  # 如果debug为True，开启重载器（reloader）
@@ -293,7 +295,7 @@ class Flask(object):
 
     def test_client(self):
         """为这个程序创建一个测试客户端。"""
-        from werkzeug import Client
+        from werkzeug.test import Client
         return Client(self, self.response_class, use_cookies=True)
 
     def open_resource(self, resource):
@@ -476,6 +478,7 @@ class Flask(object):
         request.endpoint, request.view_args = rv
         return rv
 
+    @property
     def dispatch_request(self):
         """附注请求分发工作。匹配URL，返回视图函数或错误处理器的返回值。这个返回值
         不一定得是响应对象。为了将返回值返回值转换成合适的想要对象，调用make_response。
@@ -483,12 +486,12 @@ class Flask(object):
         try:
             endpoint, values = self.match_request()
             return self.view_functions[endpoint](**values)  # 根据端点在view_functions字典内获取对应的视图函数并调用，传入视图参数
-        except HTTPException, e:
+        except HTTPException as e:
             handler = self.error_handlers.get(e.code)
             if handler is None:
                 return e
             return handler(e)
-        except Exception, e:
+        except Exception as e:
             handler = self.error_handlers.get(500)
             if self.debug or handler is None:
                 raise
@@ -511,7 +514,7 @@ class Flask(object):
         """
         if isinstance(rv, self.response_class):
             return rv
-        if isinstance(rv, basestring):
+        if isinstance(rv, str):
             return self.response_class(rv)
         if isinstance(rv, tuple):
             return self.response_class(*rv)
@@ -558,7 +561,7 @@ class Flask(object):
         with self.request_context(environ):
             rv = self.preprocess_request()  # 预处理请求，调用所有使用了before_request钩子的函数
             if rv is None:
-                rv = self.dispatch_request()  # 请求分发，获得视图函数返回值（或是错误处理器的返回值）
+                rv = self.dispatch_request  # 请求分发，获得视图函数返回值（或是错误处理器的返回值）
             response = self.make_response(rv)  # 生成响应，把上面的返回值转换成响应对象
             response = self.process_response(response)  # 响应处理，调用所有使用了after_request钩子的函数
             return response(environ, start_response)
@@ -598,7 +601,11 @@ class Flask(object):
 # 另外，你也可以阅读《Flask Web开发实战》（helloflask.com/book）第16章16.4.3小节，这一小节首先介绍了本地线程和Werkzeug中实现的Local，
 # 然后从堆栈和代理在Python中的基本实现开始，逐渐过渡到本地堆栈和本地代理的实现
 _request_ctx_stack = LocalStack()
+# current_app: 程序上下文：存储当前激活程序的程序实例
 current_app = LocalProxy(lambda: _request_ctx_stack.top.app)
+# request: 请求上下文： 请求对象，封装了客户端发出的HTTP请求中的内容
 request = LocalProxy(lambda: _request_ctx_stack.top.request)
+# session： 请求上下文： 用户会话，用于存储请求之间需要“记住”的值的字典
 session = LocalProxy(lambda: _request_ctx_stack.top.session)
+# g: 程序上下文： 用户会话，处理请求时用作临时存储的对象，每次请求都会重设这个变量
 g = LocalProxy(lambda: _request_ctx_stack.top.g)
