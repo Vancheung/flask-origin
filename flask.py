@@ -1,25 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-    Flask-Origin
-    ~~~~~~~~~~~~~
-     
-    Flask 0.1版本源码注解。
+    flask
+    ~~~~~
 
-    :copyright: (c) 2018 Grey Li
-    :license: MIT, see LICENSE for more details.
+    flask 0.2 版本源码注解
+
+    A microframework based on Werkzeug.  It's extensively documented
+    and follows best practice patterns.
+
+    :copyright: (c) 2010 by Armin Ronacher.
+    :license: BSD, see LICENSE for more details.
 """
 from __future__ import with_statement
 import os
 import sys
+import mimetypes
+from datetime import datetime, timedelta
 
+from itertools import chain
 from jinja2 import Environment, PackageLoader, FileSystemLoader
 from werkzeug.wrappers import Request as RequestBase, Response as ResponseBase
 from werkzeug.local import LocalStack, LocalProxy
 from werkzeug.test import create_environ
 from werkzeug.middleware.shared_data import SharedDataMiddleware
+from werkzeug.datastructures import ImmutableDict, Headers
+from werkzeug.utils import cached_property
+from werkzeug.wsgi import wrap_file
 from werkzeug.routing import Map, Rule
 from werkzeug.exceptions import HTTPException
 from werkzeug.contrib.securecookie import SecureCookie
+
+# try to load the best simplejson implementation available.  If JSON
+# is not installed, we add a failing class.
+json_available = True
+try:
+    import simplejson as json
+except ImportError:
+    try:
+        import json
+    except ImportError:
+        json_available = False
 
 # 这些从Werkzeug和Jinja2导入的辅助函数（utilities）没有在
 # 模块内使用，而是直接作为外部接口开放
@@ -40,25 +60,74 @@ class Request(RequestBase):
     这就是最终的flask.request对象。如果你想替换掉这个请求对象，可以子类化这个
     类，然后将你的子类赋值给flask.Flask.request_class。
     """
+    '''
+    0.2版本更新：增加了module和json
+    '''
+    endpoint = view_args = routing_exception = None
 
-    def __init__(self, environ):
-        RequestBase.__init__(self, environ)
-        self.endpoint = None  # 当前请求的端点
-        self.view_args = None  # 当前请求的视图参数，会作为关键字参数传入视图函数
+    @property
+    def module(self):
+        """The name of the current module"""
+        if self.endpoint and '.' in self.endpoint:
+            return self.endpoint.rsplit('.', 1)[0]
+
+    @cached_property
+    def json(self):
+        """If the mimetype is `application/json` this will contain the
+        parsed JSON data.
+        """
+        if __debug__:
+            _assert_have_json()
+        if self.mimetype == 'application/json':
+            return json.loads(self.data)
 
 
 class Response(ResponseBase):
-    """Flask默认使用的响应对象。除了将MIME类型默认设置为HTML外，和Werkzeug提供的响应对象
-    完全相同。通常情况下，你不需要自己创建这个对象，因为flask.Flask.make_response
-    会负责这个工作。
+    """The response object that is used by default in flask.  Works like the
+    response object from Werkzeug but is set to have a HTML mimetype by
+    default.  Quite often you don't have to create this object yourself because
+    :meth:`~flask.Flask.make_response` will take care of that for you.
 
-    如果你想替换这个响应对象，你可以子类化这个类，然后将你的子类赋值给flask.Flask.response_class。
+    If you want to replace the response object used you can subclass this and
+    set :attr:`~flask.Flask.request_class` to your subclass.
     """
     default_mimetype = 'text/html'
 
 
 class _RequestGlobals(object):
     pass
+'''
+0.2版本更新：添加Session
+'''
+
+class Session(SecureCookie):
+    """Expands the session with support for switching between permanent
+    and non-permanent sessions.
+    """
+
+    def _get_permanent(self):
+        return self.get('_permanent', False)
+
+    def _set_permanent(self, value):
+        self['_permanent'] = bool(value)
+
+    permanent = property(_get_permanent, _set_permanent)
+    del _get_permanent, _set_permanent
+
+
+class _NullSession(Session):
+    """Class used to generate nicer error messages if sessions are not
+    available.  Will still allow read-only access to the empty session
+    but fail on setting.
+    """
+
+    def _fail(self, *args, **kwargs):
+        raise RuntimeError('the session is unavailable because no secret '
+                           'key was set.  Set the secret_key on the '
+                           'application to something unique and secret')
+    __setitem__ = __delitem__ = clear = pop = popitem = \
+        update = setdefault = _fail
+    del _fail
 
 
 class _RequestContext(object):
@@ -70,11 +139,19 @@ class _RequestContext(object):
     # 调用，以便生成请求上下文。
     def __init__(self, app, environ):
         self.app = app
-        self.url_adapter = app.url_map.bind_to_environ(environ)  # 绑定了当前环境信息，用于构建URL，在url_for函数中使用
-        self.request = app.request_class(environ)  # 创建请求对象，包含请求信息
-        self.session = app.open_session(self.request)  # 创建session对象，用于存储用户会话数据到cookie中
-        self.g = _RequestGlobals()  # 创建g对象，用于在当前请求存储全局变量
-        self.flashes = None  # 存储当前请求的通过flash函数发送的消息
+        self.url_adapter = app.url_map.bind_to_environ(environ)
+        self.request = app.request_class(environ)
+        self.session = app.open_session(self.request)
+        if self.session is None:
+            self.session = _NullSession()
+        self.g = _RequestGlobals()
+        self.flashes = None
+
+        try:
+            self.request.endpoint, self.request.view_args = \
+                self.url_adapter.match()
+        except HTTPException as e:
+            self.request.routing_exception = e
 
     def __enter__(self):
         _request_ctx_stack.push(self)  # 将当前请求上下文对象推送到_request_ctx_stack堆栈，这个堆栈在最后定义
@@ -91,10 +168,59 @@ def url_for(endpoint, **values):
 
     对于目标端点未知的变量参数，将会作为查询参数附加在URL后面（生成查询字符串）。
 
-    :param endpoint: URL的端点值（函数名）。
-    :param values: URL规则的变量参数。
+    ==================== ======================= =============================
+    Active Module        Target Endpoint         Target Function
+    ==================== ======================= =============================
+    `None`               ``'index'``             `index` of the application
+    `None`               ``'.index'``            `index` of the application
+    ``'admin'``          ``'index'``             `index` of the `admin` module
+    any                  ``'.index'``            `index` of the application
+    any                  ``'admin.index'``       `index` of the `admin` module
+    ==================== ======================= =============================
+
+    Variable arguments that are unknown to the target endpoint are appended
+    to the generated URL as query arguments.
+
+    For more information, head over to the :ref:`Quickstart <url-building>`.
+
+    :param endpoint: the endpoint of the URL (name of the function)
+    :param values: the variable arguments of the URL rule
+    :param _external: if set to `True`, an absolute URL is generated.
     """
-    return _request_ctx_stack.top.url_adapter.build(endpoint, values)  # 这里堆栈的栈顶（top）即上面的请求上下文对象实例
+    ctx = _request_ctx_stack.top
+    if '.' not in endpoint:
+        mod = ctx.request.module
+        if mod is not None:
+            endpoint = mod + '.' + endpoint
+    elif endpoint.startswith('.'):
+        endpoint = endpoint[1:]
+    external = values.pop('_external', False)
+    return ctx.url_adapter.build(endpoint, values, force_external=external)
+
+'''
+0.2更新：增加模板
+'''
+def get_template_attribute(template_name, attribute):
+    """Loads a macro (or variable) a template exports.  This can be used to
+    invoke a macro from within Python code.  If you for example have a
+    template named `_foo.html` with the following contents:
+
+    .. sourcecode:: html+jinja
+
+       {% macro hello(name) %}Hello {{ name }}!{% endmacro %}
+
+    You can access this from Python code like this::
+
+        hello = get_template_attribute('_foo.html', 'hello')
+        return hello('World')
+
+    .. versionadded:: 0.2
+
+    :param template_name: the name of the template
+    :param attribute: the name of the variable of macro to acccess
+    """
+    return getattr(current_app.jinja_env.get_template(template_name).module,
+                   attribute)
 
 
 def flash(message):
@@ -103,7 +229,7 @@ def flash(message):
 
     :param message: 被闪现的消息。
     """
-    session['_flashes'] = (session.get('_flashes', [])) + [message]
+    session.setdefault('_flashes', []).append(message)
 
 
 def get_flashed_messages():
@@ -112,14 +238,121 @@ def get_flashed_messages():
     """
     flashes = _request_ctx_stack.top.flashes
     if flashes is None:
-        _request_ctx_stack.top.flashes = flashes = \
-            session.pop('_flashes', [])
+        _request_ctx_stack.top.flashes = flashes = session.pop('_flashes', [])
     return flashes
+
+
+'''
+0.2更新：增加jsno
+'''
+def jsonify(*args, **kwargs):
+    """Creates a :class:`~flask.Response` with the JSON representation of
+    the given arguments with an `application/json` mimetype.  The arguments
+    to this function are the same as to the :class:`dict` constructor.
+
+    Example usage::
+
+        @app.route('/_get_current_user')
+        def get_current_user():
+            return jsonify(username=g.user.username,
+                           email=g.user.email,
+                           id=g.user.id)
+
+    This will send a JSON response like this to the browser::
+
+        {
+            "username": "admin",
+            "email": "admin@localhost",
+            "id": 42
+        }
+
+    This requires Python 2.6 or an installed version of simplejson.
+
+    .. versionadded:: 0.2
+    """
+    if __debug__:
+        _assert_have_json()
+    return current_app.response_class(json.dumps(dict(*args, **kwargs),
+        indent=None if request.is_xhr else 2), mimetype='application/json')
+
+'''
+0.2更新：增加send_file
+'''
+def send_file(filename_or_fp, mimetype=None, as_attachment=False,
+              attachment_filename=None):
+    """Sends the contents of a file to the client.  This will use the
+    most efficient method available and configured.  By default it will
+    try to use the WSGI server's file_wrapper support.  Alternatively
+    you can set the application's :attr:`~Flask.use_x_sendfile` attribute
+    to ``True`` to directly emit an `X-Sendfile` header.  This however
+    requires support of the underlying webserver for `X-Sendfile`.
+
+    By default it will try to guess the mimetype for you, but you can
+    also explicitly provide one.  For extra security you probably want
+    to sent certain files as attachment (HTML for instance).
+
+    Please never pass filenames to this function from user sources without
+    checking them first.  Something like this is usually sufficient to
+    avoid security problems::
+
+        if '..' in filename or filename.startswith('/'):
+            abort(404)
+
+    .. versionadded:: 0.2
+
+    :param filename_or_fp: the filename of the file to send.  This is
+                           relative to the :attr:`~Flask.root_path` if a
+                           relative path is specified.
+                           Alternatively a file object might be provided
+                           in which case `X-Sendfile` might not work and
+                           fall back to the traditional method.
+    :param mimetype: the mimetype of the file if provided, otherwise
+                     auto detection happens.
+    :param as_attachment: set to `True` if you want to send this file with
+                          a ``Content-Disposition: attachment`` header.
+    :param attachment_filename: the filename for the attachment if it
+                                differs from the file's filename.
+    """
+    if isinstance(filename_or_fp, str):
+        filename = filename_or_fp
+        file = None
+    else:
+        file = filename_or_fp
+        filename = getattr(file, 'name', None)
+    if filename is not None:
+        filename = os.path.join(current_app.root_path, filename)
+    if mimetype is None and (filename or attachment_filename):
+        mimetype = mimetypes.guess_type(filename or attachment_filename)[0]
+    if mimetype is None:
+        mimetype = 'application/octet-stream'
+
+    headers = Headers()
+    if as_attachment:
+        if attachment_filename is None:
+            if filename is None:
+                raise TypeError('filename unavailable, required for '
+                                'sending as attachment')
+            attachment_filename = os.path.basename(filename)
+        headers.add('Content-Disposition', 'attachment',
+                    filename=attachment_filename)
+
+    if current_app.use_x_sendfile and filename:
+        if file is not None:
+            file.close()
+        headers['X-Sendfile'] = filename
+        data = None
+    else:
+        if file is None:
+            file = open(filename, 'rb')
+        data = wrap_file(request.environ, file)
+
+    return Response(data, mimetype=mimetype, headers=headers,
+                    direct_passthrough=True)
 
 
 def render_template(template_name, **context):
     """使用给定的上下文从模板（template）文件夹渲染一个模板。
-    
+
     :param template_name: 要被渲染的模板文件名。
     :param context: 在模板上下文中应该可用（available）的变量。
     """
@@ -148,6 +381,15 @@ def _default_template_ctx_processor():
     )
 
 
+'''
+0.2 更新：json断言
+'''
+def _assert_have_json():
+    """Helper function that fails if JSON is unavailable."""
+    if not json_available:
+        raise RuntimeError('simplejson not installed')
+
+
 def _get_package_path(name):
     """返回包的路径，如果找不到则返回当前工作目录（cwd）。"""
     try:
@@ -155,26 +397,226 @@ def _get_package_path(name):
     except (KeyError, AttributeError):
         return os.getcwd()
 
+'''
+0.2更新:增加json
+'''
+# figure out if simplejson escapes slashes.  This behaviour was changed
+# from one version to another without reason.
+if not json_available or '\\/' not in json.dumps('/'):
 
-class Flask(object):
-    """这个flask对象实现了WSGI程序并作为中心对象存在。传入的参数（package_name）为
-    程序所在的模块或包的名称。一旦这个对象被创建，它将作为一个中心注册处，所有的视图
-    函数、URL规则、模板配置等等都将注册到这里。
+    def _tojson_filter(*args, **kwargs):
+        if __debug__:
+            _assert_have_json()
+        return json.dumps(*args, **kwargs).replace('/', '\\/')
+else:
+    _tojson_filter = json.dumps
 
-    包的名称被用来从包的内部或模块所在的文件夹解析资源，具体的位置取决于传入的包名称
-    参数（package_name）指向一个真实的Python包（包含__init__.py文件的文件夹）
-    还是一个标准的模块（.py文件）。
+'''
+0.2更新：增加package
+'''
 
-    关于资源加载的更多信息，参见open_resource。
+class _PackageBoundObject(object):
 
-    通常，你会在你的主脚本或包中的__init__.py文件里使用下面的方式创建一个Flask实例：
+    def __init__(self, import_name):
+        #: the name of the package or module.  Do not change this once
+        #: it was set by the constructor.
+        self.import_name = import_name
+
+        #: where is the app root located?
+        self.root_path = _get_package_path(self.import_name)
+
+    def open_resource(self, resource):
+        """Opens a resource from the application's resource folder.  To see
+        how this works, consider the following folder structure::
+
+            /myapplication.py
+            /schemal.sql
+            /static
+                /style.css
+            /template
+                /layout.html
+                /index.html
+
+        If you want to open the `schema.sql` file you would do the
+        following::
+
+            with app.open_resource('schema.sql') as f:
+                contents = f.read()
+                do_something_with(contents)
+
+        :param resource: the name of the resource.  To access resources within
+                         subfolders use forward slashes as separator.
+        """
+        if pkg_resources is None:
+            return open(os.path.join(self.root_path, resource), 'rb')
+        return pkg_resources.resource_stream(self.import_name, resource)
+
+
+class _ModuleSetupState(object):
+
+    def __init__(self, app, url_prefix=None):
+        self.app = app
+        self.url_prefix = url_prefix
+
+'''
+0.2更新：增加module
+'''
+
+class Module(_PackageBoundObject):
+    """Container object that enables pluggable applications.  A module can
+    be used to organize larger applications.  They represent blueprints that,
+    in combination with a :class:`Flask` object are used to create a large
+    application.
+
+    A module is like an application bound to an `import_name`.  Multiple
+    modules can share the same import names, but in that case a `name` has
+    to be provided to keep them apart.  If different import names are used,
+    the rightmost part of the import name is used as name.
+
+    Here an example structure for a larger appliation::
+
+        /myapplication
+            /__init__.py
+            /views
+                /__init__.py
+                /admin.py
+                /frontend.py
+
+    The `myapplication/__init__.py` can look like this::
+
+        from flask import Flask
+        from myapplication.views.admin import admin
+        from myapplication.views.frontend import frontend
+
+        app = Flask(__name__)
+        app.register_module(admin, url_prefix='/admin')
+        app.register_module(frontend)
+
+    And here an example view module (`myapplication/views/admin.py`)::
+
+        from flask import Module
+
+        admin = Module(__name__)
+
+        @admin.route('/')
+        def index():
+            pass
+
+        @admin.route('/login')
+        def login():
+            pass
+
+    For a gentle introduction into modules, checkout the
+    :ref:`working-with-modules` section.
+    """
+
+    def __init__(self, import_name, name=None, url_prefix=None):
+        if name is None:
+            assert '.' in import_name, 'name required if package name ' \
+                'does not point to a submodule'
+            name = import_name.rsplit('.', 1)[1]
+        _PackageBoundObject.__init__(self, import_name)
+        self.name = name
+        self.url_prefix = url_prefix
+        self._register_events = []
+
+    def route(self, rule, **options):
+        """Like :meth:`Flask.route` but for a module.  The endpoint for the
+        :func:`url_for` function is prefixed with the name of the module.
+        """
+        def decorator(f):
+            self.add_url_rule(rule, f.__name__, f, **options)
+            return f
+        return decorator
+
+    def add_url_rule(self, rule, endpoint, view_func=None, **options):
+        """Like :meth:`Flask.add_url_rule` but for a module.  The endpoint for
+        the :func:`url_for` function is prefixed with the name of the module.
+        """
+        def register_rule(state):
+            the_rule = rule
+            if state.url_prefix:
+                the_rule = state.url_prefix + rule
+            state.app.add_url_rule(the_rule, '%s.%s' % (self.name, endpoint),
+                                   view_func, **options)
+        self._record(register_rule)
+
+    def before_request(self, f):
+        """Like :meth:`Flask.before_request` but for a module.  This function
+        is only executed before each request that is handled by a function of
+        that module.
+        """
+        self._record(lambda s: s.app.before_request_funcs
+            .setdefault(self.name, []).append(f))
+        return f
+
+    def before_app_request(self, f):
+        """Like :meth:`Flask.before_request`.  Such a function is executed
+        before each request, even if outside of a module.
+        """
+        self._record(lambda s: s.app.before_request_funcs
+            .setdefault(None, []).append(f))
+        return f
+
+    def after_request(self, f):
+        """Like :meth:`Flask.after_request` but for a module.  This function
+        is only executed after each request that is handled by a function of
+        that module.
+        """
+        self._record(lambda s: s.app.after_request_funcs
+            .setdefault(self.name, []).append(f))
+        return f
+
+    def after_app_request(self, f):
+        """Like :meth:`Flask.after_request` but for a module.  Such a function
+        is executed after each request, even if outside of the module.
+        """
+        self._record(lambda s: s.app.after_request_funcs
+            .setdefault(None, []).append(f))
+        return f
+
+    def context_processor(self, f):
+        """Like :meth:`Flask.context_processor` but for a modul.  This
+        function is only executed for requests handled by a module.
+        """
+        self._record(lambda s: s.app.template_context_processors
+            .setdefault(self.name, []).append(f))
+        return f
+
+    def app_context_processor(self, f):
+        """Like :meth:`Flask.context_processor` but for a module.  Such a
+        function is executed each request, even if outside of the module.
+        """
+        self._record(lambda s: s.app.template_context_processors
+            .setdefault(None, []).append(f))
+        return f
+
+    def _record(self, func):
+        self._register_events.append(func)
+
+
+class Flask(_PackageBoundObject):
+    """The flask object implements a WSGI application and acts as the central
+    object.  It is passed the name of the module or package of the
+    application.  Once it is created it will act as a central registry for
+    the view functions, the URL rules, template configuration and much more.
+
+    The name of the package is used to resolve resources from inside the
+    package or the folder the module is contained in depending on if the
+    package parameter resolves to an actual python package (a folder with
+    an `__init__.py` file inside) or a standard module (just a `.py` file).
+
+    For more information about resource loading, see :func:`open_resource`.
+
+    Usually you create a :class:`Flask` instance in your main module or
+    in the `__init__.py` file of your package like this::
 
         from flask import Flask
         app = Flask(__name__)
-    
     """
 
-    #: 用作请求对象的类。更多信息参见flask.Request。
+    #: the class that is used for request objects.  See :class:`~flask.request`
+    #: for more information.
     request_class = Request
 
     #: 用作响应对象的类。更多信息参见flask.Response。
@@ -191,31 +633,38 @@ class Flask(object):
     #: 安全cookie使用这个值作为session cookie的名称。
     session_cookie_name = 'session'  # 存储session对象数据的cookie名称
 
-    #: 直接传入Jinja2环境的选项。
-    jinja_options = dict(
-        autoescape=True,  # 默认开启自动转义，即转义不安全字符为HTML实体，比如“>”、“<”等。
+    #: A :class:`~datetime.timedelta` which is used to set the expiration
+    #: date of a permanent session.  The default is 31 days which makes a
+    #: permanent session survive for roughly one month.
+    permanent_session_lifetime = timedelta(days=31)
+
+    #: Enable this if you want to use the X-Sendfile feature.  Keep in
+    #: mind that the server has to support this.  This only affects files
+    #: sent with the :func:`send_file` method.
+    #:
+    #: .. versionadded:: 0.2
+    use_x_sendfile = False
+
+    #: options that are passed directly to the Jinja2 environment
+    jinja_options = ImmutableDict(
+        autoescape=True,
         extensions=['jinja2.ext.autoescape', 'jinja2.ext.with_']
     )
 
-    def __init__(self, package_name):
-        #: 调试标志。将它设为True来开启调试模式。在调试模式下，当一个未捕捉
-        #: 的异常触发时，调试器会启动；而且，当代码中的变动被探测到时，开发
-        #: 服务器会自动重载程序。
+    def __init__(self, import_name):
+        _PackageBoundObject.__init__(self, import_name)
+
+        #: the debug flag.  Set this to `True` to enable debugging of
+        #: the application.  In debug mode the debugger will kick in
+        #: when an unhandled exception ocurrs and the integrated server
+        #: will automatically reload the application if changes in the
+        #: code are detected.
         self.debug = False
 
-        #: 包或模块的名称。一旦它通过构造器设置后，就不要更改这个值。
-        self.package_name = package_name
-
-        #: 定位程序的根目录。
-        self.root_path = _get_package_path(self.package_name)
-
-        ###################################
-        # 下面是几个存储回调函数的字典或列表
-        ###################################
-
-        #: 一个储存所有已注册的视图函数的字典。字典的键将是函数的名称，这些名称
-        #: 也被用来生成URL；字典的值是函数对象本身。
-        #: 要注册一个视图函数，使用route装饰器（decorator）。
+        #: a dictionary of all view functions registered.  The keys will
+        #: be function names which are also used to generate URLs and
+        #: the values are the function objects themselves.
+        #: to register a view function, use the :meth:`route` decorator.
         self.view_functions = {}
 
         #: 一个储存所有已注册的错误处理器的字典。字段的键是整型（integer）类型的
@@ -233,18 +682,38 @@ class Flask(object):
         #: 要注册一个函数到这里，使用after_request装饰器。
         self.after_request_funcs = []
 
-        #: 一个将被无参数调用以生成模板上下文的的函数列表。每一个函数应返回一个
-        #: 用于更新模板上下文的字典。
-        #: 要注册一个函数到这里，使用context_processor装饰器。
-        self.template_context_processors = [_default_template_ctx_processor]  # 默认的处理器用来注入session、request和g
+        #: a dictionary with list of functions that are called without argument
+        #: to populate the template context.  They key of the dictionary is the
+        #: name of the module this function is active for, `None` for all
+        #: requests.  Each returns a dictionary that the template context is
+        #: updated with.  To register a function here, use the
+        #: :meth:`context_processor` decorator.
+        self.template_context_processors = {
+            None: [_default_template_ctx_processor]
+        }
 
+        #: the :class:`~werkzeug.routing.Map` for this instance.  You can use
+        #: this to change the routing converters after the class was created
+        #: but before any routes are connected.  Example::
+        #:
+        #:    from werkzeug import BaseConverter
+        #:
+        #:    class ListConverter(BaseConverter):
+        #:        def to_python(self, value):
+        #:            return value.split(',')
+        #:        def to_url(self, values):
+        #:            return ','.join(BaseConverter.to_url(value)
+        #:                            for value in values)
+        #:
+        #:    app = Flask(__name__)
+        #:    app.url_map.converters['list'] = ListConverter
         self.url_map = Map()
 
         if self.static_path is not None:
-            self.url_map.add(Rule(self.static_path + '/<filename>',
-                                  build_only=True, endpoint='static'))
+            self.add_url_rule(self.static_path + '/<filename>',
+                              build_only=True, endpoint='static')
             if pkg_resources is not None:
-                target = (self.package_name, 'static')
+                target = (self.import_name, 'static')
             else:
                 target = os.path.join(self.root_path, 'static')
             self.wsgi_app = SharedDataMiddleware(self.wsgi_app, {  # SharedDataMiddleware中间件用来为程序添加处理静态文件的能力
@@ -259,6 +728,7 @@ class Flask(object):
             url_for=url_for,
             get_flashed_messages=get_flashed_messages
         )
+        self.jinja_env.filters['tojson'] = _tojson_filter
 
     def create_jinja_loader(self):
         """创建Jinja加载器。默认只是返回一个对应配置好的包的包加载器，它会从
@@ -266,25 +736,31 @@ class Flask(object):
         """
         if pkg_resources is None:
             return FileSystemLoader(os.path.join(self.root_path, 'templates'))
-        return PackageLoader(self.package_name)
+        return PackageLoader(self.import_name)
 
     def update_template_context(self, context):
         """使用常用的变量更新模板上下文。这会注入request、session和g到模板上下文中。
 
         :param context: 包含额外添加的变量的字典，用来更新上下文。
         """
-        reqctx = _request_ctx_stack.top
-        for func in self.template_context_processors:  # 调用所有使用context_processor装饰器注册的模板上下文处理函数，更新模板上下文
+        funcs = self.template_context_processors[None]
+        mod = _request_ctx_stack.top.request.module
+        if mod is not None and mod in self.template_context_processors:
+            funcs = chain(funcs, self.template_context_processors[mod])
+        for func in funcs:
             context.update(func())
 
-    def run(self, host='localhost', port=5000, **options):
-        """在本地开发服务器上运行程序。如果debug标志被设置，这个服务器
-        会在代码更改时自动重载，并会在异常发生时显示一个调试器。
-        
-        :param host: 监听的主机名。设为'0.0.0.0'可以让服务器外部可见。
-        :param port: 服务器的端口。
-        :param options: 这些选项将被转发给底层的Werkzeug服务器。更多信息
-                        参见werkzeug.run_simple。
+    def run(self, host='127.0.0.1', port=5000, **options):
+        """Runs the application on a local development server.  If the
+        :attr:`debug` flag is set the server will automatically reload
+        for code changes and show a debugger in case an exception happened.
+
+        :param host: the hostname to listen on.  set this to ``'0.0.0.0'``
+                     to have the server available externally as well.
+        :param port: the port of the webserver
+        :param options: the options to be forwarded to the underlying
+                        Werkzeug server.  See :func:`werkzeug.run_simple`
+                        for more information.
         """
         from werkzeug.serving import run_simple
         if 'debug' in options:
@@ -298,30 +774,6 @@ class Flask(object):
         from werkzeug.test import Client
         return Client(self, self.response_class, use_cookies=True)
 
-    def open_resource(self, resource):
-        """从程序的资源文件夹打开一个资源。至于它是如何工作的，考虑下面的文件
-        目录：
-
-            /myapplication.py
-            /schemal.sql
-            /static
-                /style.css
-            /templates
-                /layout.html
-                /index.html
-
-        如果你想打开schema.sql文件，可以这样做：
-
-            with app.open_resource('schema.sql') as f:
-                contents = f.read()
-                do_something_with(contents)
-
-        :param resource: 资源文件的名称。要获取子文件夹中的资源，使用斜线作为分界符。
-        """
-        if pkg_resources is None:
-            return open(os.path.join(self.root_path, resource), 'rb')
-        return pkg_resources.resource_stream(self.package_name, resource)
-
     def open_session(self, request):
         """创建或打开一个新的session。默认的实现是存储所有的用户会话（session）
         数据到一个签名的cookie中。这需要secret_key属性被设置。
@@ -330,46 +782,78 @@ class Flask(object):
         """
         key = self.secret_key
         if key is not None:
-            return SecureCookie.load_cookie(request, self.session_cookie_name,
-                                            secret_key=key)
+            return Session.load_cookie(request, self.session_cookie_name,
+                                       secret_key=key)
 
     def save_session(self, session, response):
-        """如果需要更新，保存session。默认实现参见open_session。
-        
-        :param session: 要被保存的session
-                        （一个werkzeug.contrib.securecookie.SecureCookie对象）
-        :param response: 一个response_class实例。
+        """Saves the session if it needs updates.  For the default
+        implementation, check :meth:`open_session`.
+
+        :param session: the session to be saved (a
+                        :class:`~werkzeug.contrib.securecookie.SecureCookie`
+                        object)
+        :param response: an instance of :attr:`response_class`
         """
-        if session is not None:
-            session.save_cookie(response, self.session_cookie_name)
+        expires = None
+        if session.permanent:
+            expires = datetime.utcnow() + self.permanent_session_lifetime
+        session.save_cookie(response, self.session_cookie_name,
+                            expires=expires, httponly=True)
 
-    def add_url_rule(self, rule, endpoint, **options):
-        """连接一个URL规则。效果和route装饰器完全相同，不过不会为端点注册视图函数。
+    def register_module(self, module, **options):
+        """Registers a module with this application.  The keyword argument
+        of this function are the same as the ones for the constructor of the
+        :class:`Module` class and will override the values of the module if
+        provided.
+        """
+        options.setdefault('url_prefix', module.url_prefix)
+        state = _ModuleSetupState(self, **options)
+        for func in module._register_events:
+            func(state)
 
-        基本示例：
+    def add_url_rule(self, rule, endpoint=None, view_func=None, **options):
+        """Connects a URL rule.  Works exactly like the :meth:`route`
+        decorator.  If a view_func is provided it will be registered with the
+        endpoint.
+
+        Basically this example::
 
             @app.route('/')
             def index():
                 pass
 
-        和下面相同：
+        Is equivalent to the following::
 
             def index():
                 pass
-            app.add_url_rule('/', 'index')
+            app.add_url_rule('/', 'index', index)
+
+        If the view_func is not provided you will need to connect the endpoint
+        to a view function like so::
+
             app.view_functions['index'] = index
 
-        :param rule: 字符串形式的URL规则。
-        :param endpoint: 对应被注册的URL规则的端点。Flask默认将视图函数名作为端点。
-        :param options: 转发给底层的werkzeug.routing.Rule对象的选项。
-        """
-        options['endpoint'] = endpoint
-        options.setdefault('methods', ('GET',))  #  默认监听GET方法
-        self.url_map.add(Rule(rule, **options))
+        .. versionchanged:: 0.2
+           `view_func` parameter added.
 
-    ################################################################################
-    # 下面是几个用于注册各类回调函数的装饰器，函数对象存储到上面创建的几个字典和列表属性中  
-    ################################################################################
+        :param rule: the URL rule as string
+        :param endpoint: the endpoint for the registered URL rule.  Flask
+                         itself assumes the name of the view function as
+                         endpoint
+        :param view_func: the function to call when serving a request to the
+                          provided endpoint
+        :param options: the options to be forwarded to the underlying
+                        :class:`~werkzeug.routing.Rule` object
+        """
+        if endpoint is None:
+            assert view_func is not None, 'expected view func if endpoint ' \
+                                          'is not provided.'
+            endpoint = view_func.__name__
+        options['endpoint'] = endpoint
+        options.setdefault('methods', ('GET',))
+        self.url_map.add(Rule(rule, **options))
+        if view_func is not None:
+            self.view_functions[endpoint] = view_func
 
     def route(self, rule, **options):
         """一个用于为给定的URL规则注册视图函数的装饰器。示例：
@@ -386,11 +870,11 @@ class Flask(object):
 
         可用的转换器如下所示：
 
-        ========= =======================================
-        int       接受整型
-        float     类似int，但是接受浮点数（floating point）
-        path      类似默认值，但接受斜线
-        ========= =======================================
+        =========== ===========================================
+        `int`       accepts integers
+        `float`     like `int` but for floating point values
+        `path`      like the default but also accepts slashes
+        =========== ===========================================
 
         下面是一些示例：
 
@@ -413,7 +897,7 @@ class Flask(object):
         会被重定向到相同的页面并附加一个结尾斜线。
         2. 如果一个规则没有以斜线结尾而用户请求的页面包含了一个结尾斜线，
         会抛出一个404错误。
-        
+
         这和Web服务器处理静态文件的方式相一致。这也可以让你安全的使用相对链接目标。
 
         这个route装饰器也接受一系列参数：
@@ -426,8 +910,7 @@ class Flask(object):
         :param options: 转发到底层的werkzeug.routing.Rule对象的其他选项。
         """
         def decorator(f):
-            self.add_url_rule(rule, f.__name__, **options)
-            self.view_functions[f.__name__] = f  # 将端点（默认使用函数名，即f.__name__）和函数对象的映射存储到view_functions字典
+            self.add_url_rule(rule, None, f, **options)
             return f
         return decorator
 
@@ -435,57 +918,67 @@ class Flask(object):
         """一个用于为给定的错误码注册函数的装饰器。示例：
 
             @app.errorhandler(404)
-            def page_not_found(error):
+            def page_not_found():
                 return 'This page does not exist', 404
 
         你也可以不使用errorhandler注册一个函数作为错误处理器。下面的例子同上：
 
-            def page_not_found(error):
+            def page_not_found():
                 return 'This page does not exist', 404
             app.error_handlers[404] = page_not_found
 
         :param code: 对应处理器的整型类型的错误代码。
         """
         def decorator(f):
-            self.error_handlers[code] = f  # 将错误码和函数对象的映射存储到error_handlers字典
+            self.error_handlers[code] = f
+            return f
+        return decorator
+
+    def template_filter(self, name=None):
+        """A decorator that is used to register custom template filter.
+        You can specify a name for the filter, otherwise the function
+        name will be used. Example::
+
+          @app.template_filter()
+          def reverse(s):
+              return s[::-1]
+
+        :param name: the optional name of the filter, otherwise the
+                     function name will be used.
+        """
+        def decorator(f):
+            self.jinja_env.filters[name or f.__name__] = f
             return f
         return decorator
 
     def before_request(self, f):
-        """注册一个函数，则每一个请求处理前调用。"""
-        self.before_request_funcs.append(f)
+        """Registers a function to run before each request."""
+        self.before_request_funcs.setdefault(None, []).append(f)
         return f
 
     def after_request(self, f):
-        """注册一个函数，在每一个请求处理后调用。"""
-        self.after_request_funcs.append(f)
+        """Register a function to be run after each request."""
+        self.after_request_funcs.setdefault(None, []).append(f)
         return f
 
     def context_processor(self, f):
-        """注册一个模板上下文处理函数。"""
-        self.template_context_processors.append(f)
+        """Registers a template context processor function."""
+        self.template_context_processors[None].append(f)
         return f
-    
+
     #################################
     # 下面的几个方法用于处理请求和响应
     #################################
 
-    def match_request(self):
-        """基于URL映射（map）匹配当前请求。如果匹配成功，同时也存储端点和
-        视图参数，否则存储异常。
-        """
-        rv = _request_ctx_stack.top.url_adapter.match()
-        request.endpoint, request.view_args = rv
-        return rv
-
-    @property
     def dispatch_request(self):
         """附注请求分发工作。匹配URL，返回视图函数或错误处理器的返回值。这个返回值
         不一定得是响应对象。为了将返回值返回值转换成合适的想要对象，调用make_response。
         """
+        req = _request_ctx_stack.top.request
         try:
-            endpoint, values = self.match_request()
-            return self.view_functions[endpoint](**values)  # 根据端点在view_functions字典内获取对应的视图函数并调用，传入视图参数
+            if req.routing_exception is not None:
+                raise req.routing_exception
+            return self.view_functions[req.endpoint](**req.view_args)
         except HTTPException as e:
             handler = self.error_handlers.get(e.code)
             if handler is None:
@@ -502,16 +995,22 @@ class Flask(object):
 
         rv允许的类型如下所示：
 
-        ======================= ===============================================
-        response_class          这个对象将被直接返回
-        str                     使用这个字符串作为主体创建一个请求对象
-        unicode                 将这个字符串进行utf-8编码后作为主体创建一个请求对象
-        tuple                   使用这个元组的内容作为参数创建一个请求对象
-        a WSGI function         这个函数将作为WSGI程序调用并缓存为响应对象
-        ======================= ===============================================
+        ======================= ===========================================
+        :attr:`response_class`  the object is returned unchanged
+        :class:`str`            a response object is created with the
+                                string as body
+        :class:`unicode`        a response object is created with the
+                                string encoded to utf-8 as body
+        :class:`tuple`          the response object is created with the
+                                contents of the tuple as arguments
+        a WSGI function         the function is called as WSGI application
+                                and buffered as response object
+        ======================= ===========================================
 
         :param rv: 视图函数返回值
         """
+        if rv is None:
+            raise ValueError('View function did not return a response')
         if isinstance(rv, self.response_class):
             return rv
         if isinstance(rv, str):
@@ -525,7 +1024,11 @@ class Flask(object):
         装饰的函数。如果其中某一个函数返回一个值，这个值将会作为视图返回值
         处理并停止进一步的请求处理。
         """
-        for func in self.before_request_funcs:
+        funcs = self.before_request_funcs.get(None, ())
+        mod = request.module
+        if mod and mod in self.before_request_funcs:
+            funcs = chain(funcs, self.before_request_funcs[mod])
+        for func in funcs:
             rv = func()
             if rv is not None:
                 return rv
@@ -537,10 +1040,16 @@ class Flask(object):
         :param response: 一个response_class对象。
         :return: 一个新的响应对象或原对象，必须是response_class实例。
         """
-        session = _request_ctx_stack.top.session
-        if session is not None:
-            self.save_session(session, response)
-        for handler in self.after_request_funcs:
+        ctx = _request_ctx_stack.top
+        mod = ctx.request.module
+        if not isinstance(ctx.session, _NullSession):
+            self.save_session(ctx.session, response)
+        funcs = ()
+        if mod and mod in self.after_request_funcs:
+            funcs = chain(funcs, self.after_request_funcs[mod])
+        if None in self.after_request_funcs:
+            funcs = chain(funcs, self.after_request_funcs[None])
+        for handler in funcs:
             response = handler(response)
         return response
 
@@ -549,13 +1058,23 @@ class Flask(object):
     #########################################################################
 
     def wsgi_app(self, environ, start_response):
-        """实际的WSGI程序。它没有通过__call__实现，因此可以附加中间件：
-        
+        """The actual WSGI application.  This is not implemented in
+        `__call__` so that middlewares can be applied without losing a
+        reference to the class.  So instead of doing this::
+
+            app = MyMiddleware(app)
+
+        It's a better idea to do this instead::
+
             app.wsgi_app = MyMiddleware(app.wsgi_app)
 
-        :param environ: 一个WSGI环境。
-        :param start_response: 一个接受状态码的可调用对象，一个包含首部
-                               的列表以及一个可选的用于启动响应的异常上下文。
+        Then you still have the original application object around and
+        can continue to call methods on it.
+
+        :param environ: a WSGI environment
+        :param start_response: a callable accepting a status code,
+                               a list of headers and an optional
+                               exception context to start the response
         """
         # 在with语句下执行相关操作，会触发_RequestContext中的__enter__方法，从而推送请求上下文到堆栈中
         with self.request_context(environ):
@@ -571,7 +1090,7 @@ class Flask(object):
         语句使用，因为请求仅绑定在with块中的当前上下文里。
 
         用法示例：
-            
+
             with app.request_context(environ):
                 do_something_with(request)
 
@@ -601,11 +1120,7 @@ class Flask(object):
 # 另外，你也可以阅读《Flask Web开发实战》（helloflask.com/book）第16章16.4.3小节，这一小节首先介绍了本地线程和Werkzeug中实现的Local，
 # 然后从堆栈和代理在Python中的基本实现开始，逐渐过渡到本地堆栈和本地代理的实现
 _request_ctx_stack = LocalStack()
-# current_app: 程序上下文：存储当前激活程序的程序实例
 current_app = LocalProxy(lambda: _request_ctx_stack.top.app)
-# request: 请求上下文： 请求对象，封装了客户端发出的HTTP请求中的内容
 request = LocalProxy(lambda: _request_ctx_stack.top.request)
-# session： 请求上下文： 用户会话，用于存储请求之间需要“记住”的值的字典
 session = LocalProxy(lambda: _request_ctx_stack.top.session)
-# g: 程序上下文： 用户会话，处理请求时用作临时存储的对象，每次请求都会重设这个变量
 g = LocalProxy(lambda: _request_ctx_stack.top.g)
